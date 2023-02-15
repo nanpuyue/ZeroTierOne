@@ -24,6 +24,7 @@
 #include <array>
 #include <thread>
 #include <mutex>
+#include <pcap.h>
 #include "../node/MulticastGroup.hpp"
 #include "EthernetTap.hpp"
 
@@ -59,6 +60,7 @@ public:
 
 private:
 	void (*_handler)(void *,void *,uint64_t,const MAC &,const MAC &,unsigned int,unsigned int,const void *,unsigned int);
+	static void _pcap_cb(u_char *, const pcap_pkthdr *, const u_char *);
 	void *_arg;
 	uint64_t _nwid;
 	MAC _mac;
@@ -66,8 +68,7 @@ private:
 	std::string _dev;
 	std::vector<MulticastGroup> _multicastGroups;
 	unsigned int _mtu;
-	int _fd;
-	int _shutdownSignalPipe[2];
+	pcap_t* _pcap_handle;
 	std::atomic_bool _enabled;
 	std::atomic_bool _run;
 	std::thread _tapReaderThread;

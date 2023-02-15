@@ -164,6 +164,18 @@ std::ostream& hex_dump(std::ostream& os, const uint8_t* buffer, size_t bufsize, 
 	return os;
 }
 
+void LinuxEthernetTap::_pcap_cb(u_char *user, const pcap_pkthdr *h, const u_char *packet){
+	class LinuxEthernetTap* cb_user = (class LinuxEthernetTap*)user;
+	unsigned int len = h->caplen;
+
+	// hex_dump(std::cout, (const uint8_t *)(packet),(unsigned int)(len));
+	unsigned int etherType = Utils::ntoh(((const uint16_t *)packet)[6]);
+	MAC to(packet, 6),from(packet + 6, 6);
+	// char buf[18];
+	// std::cout << from.toString(buf) << " -> " << to.toString(buf) << std::endl;
+	cb_user->_handler(cb_user->_arg, nullptr, cb_user->_nwid, from, to, etherType, 0, (const void *)(packet + 14),(unsigned int)(len - 14));
+}
+
 LinuxEthernetTap::LinuxEthernetTap(
 	const char *homePath,
 	const MAC &mac,
@@ -179,7 +191,7 @@ LinuxEthernetTap::LinuxEthernetTap(
 	_mac(mac),
 	_homePath(homePath),
 	_mtu(mtu),
-	_fd(0),
+	_pcap_handle(NULL),
 	_enabled(true),
 	_run(true)
 {
@@ -194,13 +206,6 @@ LinuxEthernetTap::LinuxEthernetTap(
 	(void)LinuxNetLink::getInstance();
 
 	OSUtils::ztsnprintf(nwids,sizeof(nwids),"%.16llx",nwid);
-
-	// _fd = ::open("/dev/net/tun",O_RDWR);
-	// if (_fd <= 0) {
-	// 	_fd = ::open("/dev/tun",O_RDWR);
-	// 	if (_fd <= 0)
-	// 		throw std::runtime_error(std::string("could not open TUN/TAP device: ") + strerror(errno));
-	// }
 
 	struct ifreq ifr;
 	memset(&ifr,0,sizeof(ifr));
@@ -261,61 +266,11 @@ LinuxEthernetTap::LinuxEthernetTap(
 #endif
 	}
 
-	// ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-	// if (ioctl(_fd,TUNSETIFF,(void *)&ifr) < 0) {
-	// 	::close(_fd);
-	// 	throw std::runtime_error("unable to configure TUN/TAP device for TAP operation");
-	// }
-
-	/* Open PF_PACKET socket */
-	if ((_fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) == -1) {
-		perror("listener: socket");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Set interface to promiscuous mode - do we need to do this every time? */
-	// ioctl(_fd, SIOCGIFFLAGS, &ifr);
-	// ifr.ifr_flags |= IFF_PROMISC;
-	// ioctl(_fd, SIOCSIFFLAGS, &ifr);
-
-	strcpy(ifr.ifr_name, "veth1");
-	ioctl(_fd, SIOCGIFINDEX, &ifr);
-	struct sockaddr_ll addr = {0};
-	addr.sll_family = AF_PACKET;
-	addr.sll_ifindex = ifr.ifr_ifindex;
-	addr.sll_protocol = htons(ETH_P_ALL);
-	if (bind(_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-		perror("bind");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Allow the socket to be reused - incase connection is closed prematurely */
-	// int sockopt;
-	// if (setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof sockopt) == -1) {
-	// 	perror("setsockopt");
-	// 	::close(_fd);
-	// 	exit(EXIT_FAILURE);
-	// }
-	/* Bind to device */
-	// if (setsockopt(_fd, SOL_SOCKET, SO_BINDTODEVICE, "veth1", IFNAMSIZ-1) == -1)	{
-	// 	perror("SO_BINDTODEVICE");
-	// 	::close(_fd);
-	// 	exit(EXIT_FAILURE);
-	// }
-
-	// ::ioctl(_fd,TUNSETPERSIST,0); // valgrind may generate a false alarm here
 	strcpy(ifr.ifr_name, "veth0");
 	_dev = ifr.ifr_name;
 	OSUtils::ztsnprintf(procpath,sizeof(procpath),"/proc/sys/net/ipv4/conf/%s",ifr.ifr_name);
-	::fcntl(_fd,F_SETFD,fcntl(_fd,F_GETFD) | FD_CLOEXEC);
-
-	(void)::pipe(_shutdownSignalPipe);
 
 	_tapReaderThread = std::thread([this]{
-		uint8_t b[ZT_TAP_BUF_SIZE];
-		fd_set readfds,nullfds;
-		int n,nfds,r;
-		std::vector<void *> buffers;
 		struct ifreq ifr;
 
 		memset(&ifr,0,sizeof(ifr));
@@ -380,69 +335,36 @@ LinuxEthernetTap::LinuxEthernetTap(
 			}
 		}
 
-		fcntl(_fd,F_SETFL,O_NONBLOCK);
-
 		::close(sock);
 
 		if (!_run)
 			return;
 
-		FD_ZERO(&readfds);
-		FD_ZERO(&nullfds);
-		nfds = (int)std::max(_shutdownSignalPipe[0],_fd) + 1;
+		/* create capture handle of libpcap */
+		char ebuf[PCAP_ERRBUF_SIZE];
+		_pcap_handle = pcap_open_live("veth1", ZT_TAP_BUF_SIZE, 0, 1, ebuf);
+		if(_pcap_handle == NULL) {
+			printf("Couldn't open device %s: %s\n", "veth1", ebuf);
+			return;;
+		}
+		if (pcap_setdirection(_pcap_handle, PCAP_D_IN) == -1) {
+			pcap_perror(_pcap_handle, "pcap_setdirection");
+			return;
+		}
 
-		r = 0;
-		for(;;) {
-			FD_SET(_shutdownSignalPipe[0],&readfds);
-			FD_SET(_fd,&readfds);
-			select(nfds,&readfds,&nullfds,&nullfds,(struct timeval *)0);
-
-			if (FD_ISSET(_shutdownSignalPipe[0],&readfds))
-				break;
-
-			if (FD_ISSET(_fd,&readfds)) {
-				for(;;) { // read until there are no more packets, then return to outer select() loop
-					n = (int)::read(_fd,b + r,ZT_TAP_BUF_SIZE - r);
-					if (n > 0) {
-						// Some tap drivers like to send the ethernet frame and the
-						// payload in two chunks, so handle that by accumulating
-						// data until we have at least a frame.
-						r += n;
-						if (r > 14) {
-							if (r > ((int)_mtu + 14)) // sanity check for weird TAP behavior on some platforms
-								r = _mtu + 14;
-
-							if (_enabled) {
-								//_tapq.post(std::pair<void *,int>(buf,r));
-								//buf = nullptr;
-								MAC to(b, 6),from(b + 6, 6);
-								unsigned int etherType = Utils::ntoh(((const uint16_t *)b)[6]);
-								char buf[18];
-								std::cout << from.toString(buf) << " -> " << to.toString(buf) << std::endl;
-								hex_dump(std::cout, (const uint8_t *)(b + 14),(unsigned int)(r - 14));
-								_handler(_arg, nullptr, _nwid, from, to, etherType, 0, (const void *)(b + 14),(unsigned int)(r - 14));
-							}
-
-							r = 0;
-						}
-					} else {
-						r = 0;
-						break;
-					}
-				}
-			}
+		/* start the loop of capture */
+		if (pcap_loop(_pcap_handle, -1, (pcap_handler)_pcap_cb, (u_char*)this) == -1) {
+			pcap_perror(_pcap_handle, "pcap_loop");
 		}
 	});
 }
 
 LinuxEthernetTap::~LinuxEthernetTap()
 {
+	pcap_breakloop(_pcap_handle);
+	pcap_close(_pcap_handle);
 	_run = false;
-	(void)::write(_shutdownSignalPipe[1],"\0",1);
 	_tapReaderThread.join();
-	::close(_fd);
-	::close(_shutdownSignalPipe[0]);
-	::close(_shutdownSignalPipe[1]);
 }
 
 void LinuxEthernetTap::setEnabled(bool en)
@@ -572,14 +494,14 @@ std::vector<InetAddress> LinuxEthernetTap::ips() const
 
 void LinuxEthernetTap::put(const MAC &from,const MAC &to,unsigned int etherType,const void *data,unsigned int len)
 {
-	char putBuf[ZT_MAX_MTU + 64];
-	if ((_fd > 0)&&(len <= _mtu)&&(_enabled)) {
+	u_char putBuf[ZT_MAX_MTU + 64];
+	if ((_pcap_handle != NULL)&&(len <= _mtu)&&(_enabled)) {
 		to.copyTo(putBuf,6);
 		from.copyTo(putBuf + 6,6);
 		*((uint16_t *)(putBuf + 12)) = htons((uint16_t)etherType);
 		memcpy(putBuf + 14,data,len);
 		len += 14;
-		(void)::write(_fd,putBuf,len);
+		pcap_sendpacket(_pcap_handle,putBuf,len);
 	}
 }
 
